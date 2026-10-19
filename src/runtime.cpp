@@ -1,63 +1,33 @@
 #include "runtime.hpp"
 
 #include <sched.h>
-#include <unistd.h>
-#include <fcntl.h>
 #include <sys/wait.h>
 #include <sys/mount.h>
-#include <sys/stat.h>
-#include <sys/mman.h>
-#include <sys/sysmacros.h>
 #include <csignal>
 #include <cerrno>
 #include <cstring>
 #include <cstdio>
-#include <memory>
 
-namespace runtime {
 
-    namespace _detail
+#include <expected>
+#include <sys/stat.h>
+#include "internal/terminal.hpp"
+#include "internal/utils.hpp"
+#include "internal/channels.hpp"
+
+namespace runtime
+{
+
+    struct ChildArgs {
+        const char* rootfs;
+        char* const* argv;
+        int sync_fd;
+        int err_fd;
+        int pty_slave_fd;
+    };
+
+    namespace child
     {
-        constexpr size_t kStack = 1 << 20;
-        constexpr std::uint64_t kDefaultFlags =  CLONE_NEWPID | /*CLONE_NEWNS  |*/ CLONE_NEWUSER |
-                                                CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET;
-
-        template <typename F>
-        auto retry(F&& f) -> decltype(f()) {
-            for (;;) {
-                auto r = f();
-                if (r < 0 && errno == EINTR) 
-                    continue;
-                
-                return r;
-            }
-        }
-
-        struct MunmapDeleter {
-            size_t n;
-            void operator()(char* p) const noexcept {
-                if (p) 
-                    ::munmap(p, n);
-            }
-        };
-
-        std::unique_ptr<char, MunmapDeleter> make_stack(size_t n) {
-            void* p = ::mmap(nullptr, n, PROT_READ | PROT_WRITE,
-                                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
-
-            return std::unique_ptr<char, MunmapDeleter>{ p == MAP_FAILED ? nullptr : static_cast<char*>(p), MunmapDeleter{n}};
-        }
-    }
-    
-    namespace {
-
-        struct ChildArgs {
-            const char* rootfs;
-            char* const* argv;
-            int sync_fd;
-            int err_fd;
-        };
-
         void die(int err_fd, int e) 
         {
             int saved = e;
@@ -65,7 +35,34 @@ namespace runtime {
             ::_exit(127);
         }
 
-        int child_main(void* p) 
+        void mount_at ( const char* rootfs, const char* sub, mode_t mode,
+                        const char* fstype, unsigned long flags, const char* data,
+                        int err_fd )
+        {
+            char path[512];
+            std::snprintf(path, sizeof(path), "%s%s", rootfs, sub);
+
+            if (::mkdir(path, mode) != 0 && errno != EEXIST)
+                die(err_fd, errno);
+
+            if (::mount(fstype, path, fstype, flags, data) != 0)
+                die(err_fd, errno);
+        }
+
+        void attach_pty(int slave_fd, int err_fd) {
+            if (::setsid() < 0)
+                die(err_fd, errno);
+            if (::ioctl(slave_fd, TIOCSCTTY, 0) < 0)
+                die(err_fd, errno);
+            if (::dup2(slave_fd, STDIN_FILENO)  < 0 ||
+                ::dup2(slave_fd, STDOUT_FILENO) < 0 ||
+                ::dup2(slave_fd, STDERR_FILENO) < 0)
+                die(err_fd, errno);
+            if (slave_fd > STDERR_FILENO)
+                ::close(slave_fd);
+        }
+
+        int run(void* p) 
         {
             auto* a = static_cast<ChildArgs*>(p);
 
@@ -78,23 +75,12 @@ namespace runtime {
             if (::sethostname(new_hostname, std::strlen(new_hostname)) != 0)
                 die(a->err_fd, errno);
 
-            char path[512];
-            std::snprintf(path, sizeof(path), "%s/proc", a->rootfs);
-            if (::mkdir(path, 0555) != 0 && errno != EEXIST)
-                die(a->err_fd, errno);
+            mount_at(a->rootfs, "/proc", 0555, "proc",  0, nullptr,     a->err_fd);
+            mount_at(a->rootfs, "/dev",  0755, "tmpfs", 0, "mode=0755", a->err_fd);         
 
-            std::snprintf(path, sizeof(path), "%s/dev", a->rootfs);
-            if (::mkdir(path, 0755) != 0 && errno != EEXIST)
-                die(a->err_fd, errno);
+            if (a->pty_slave_fd >= 0)
+                attach_pty(a->pty_slave_fd, a->err_fd);
 
-            
-            std::snprintf(path, sizeof(path), "%s/proc", a->rootfs);
-            if (::mount("proc", path, "proc", 0, nullptr) != 0)
-                die(a->err_fd, errno);
-
-            std::snprintf(path, sizeof(path), "%s/dev", a->rootfs);
-            if (::mount("tmpfs", path, "tmpfs", 0, "mode=0755") != 0)
-                die(a->err_fd, errno);
 
             if (::chroot(a->rootfs) != 0)
                 die(a->err_fd, errno);
@@ -104,7 +90,10 @@ namespace runtime {
             ::execvp(a->argv[0], a->argv);
             die(a->err_fd, errno);
         }
+    }
 
+    namespace parent
+    {
         bool write_proc(const char* path, const char* data) {
             int fd = ::open(path, O_WRONLY | O_CLOEXEC);
             if (fd < 0) 
@@ -138,32 +127,13 @@ namespace runtime {
             }
             return true;
         }
-
-        struct Pipe {
-            int r_ = -1, w_ = -1;
-
-            Pipe() {
-                int fds[2];
-                if (::pipe2(fds, O_CLOEXEC) != 0) 
-                    return;
-                r_ = fds[0]; w_ = fds[1];
-            }
-
-            ~Pipe() {
-                if (r_ >= 0) 
-                    ::close(r_);
-                if (w_ >= 0) 
-                    ::close(w_);
-            }
-
-            Pipe(const Pipe&) = delete;
-            Pipe& operator=(const Pipe&) = delete;
-
-            bool ok() const noexcept { return r_ >= 0 && w_ >= 0; }
-        };
-
     }
 
+
+
+    constexpr size_t kStack = 1 << 20;
+    constexpr std::uint64_t kDefaultFlags =  CLONE_NEWPID | CLONE_NEWNS  | CLONE_NEWUSER |
+                                             CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET;
 
     std::expected<int, Error> run(const Request& req) 
     {
@@ -173,25 +143,29 @@ namespace runtime {
         Pipe sync, err;
         if (!sync.ok() || !err.ok()) 
             return std::unexpected(Error{1, errno, "pipe create"});
+        PtyChannel pty;
+        if (!pty.ok())
+            return std::unexpected(Error{1, errno, "pty open"});
 
         std::vector<char*> argv = req.argv;
         argv.push_back(nullptr);
 
-        auto stack = _detail::make_stack(_detail::kStack);
+        auto stack = _detail::make_stack(kStack);
         if (!stack) 
             return std::unexpected(Error{2, errno, "mmap stack"});
 
-        ChildArgs args{req.rootfs.c_str(), argv.data(), sync.r_, err.w_};
+        ChildArgs args{req.rootfs.c_str(), argv.data(), sync.r_, err.w_, pty.slave};
 
-        pid_t pid = ::clone(child_main, 
-                            static_cast<char*>(stack.get()) + _detail::kStack, 
-                            _detail::kDefaultFlags | SIGCHLD, 
+        pid_t pid = ::clone(child::run, 
+                            static_cast<char*>(stack.get()) + kStack, 
+                            kDefaultFlags | SIGCHLD, 
                             &args);
         if (pid < 0) 
             return std::unexpected(Error{3, errno, "clone"});
-        ::close(err.w_); err.w_ = -1; 
+        ::close(err.w_); err.w_ = -1;
+        ::close(pty.slave); pty.slave = -1; 
 
-        if (!map_user(pid)) {
+        if (!parent::map_user(pid)) {
             int e = errno;
             ::kill(pid, SIGKILL); ::waitpid(pid, nullptr, 0);
             return std::unexpected(Error{4, e, "map user"});
@@ -219,6 +193,19 @@ namespace runtime {
             return std::unexpected(Error{6, child_err, "child"});
         }
 
+        struct termios saved{};
+        bool raw = terminal::enter_raw(STDIN_FILENO, &saved);
+        struct Restore {
+            int fd;
+            struct termios saved;
+            bool active;
+            ~Restore() { 
+                if (active) 
+                    terminal::restore(fd, &saved); 
+            }
+        } restore{STDIN_FILENO, saved, raw};
+        terminal::relay(pty.master);
+
         int status = 0;
         pid_t r = _detail::retry([&]() { return ::waitpid(pid, &status, 0); });
         if (r < 0)
@@ -228,5 +215,4 @@ namespace runtime {
         if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
         return std::unexpected(Error{7, 0, "abnormal status"});
     }
-
-} 
+}
