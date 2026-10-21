@@ -81,7 +81,6 @@ namespace runtime
             if (a->pty_slave_fd >= 0)
                 attach_pty(a->pty_slave_fd, a->err_fd);
 
-
             if (::chroot(a->rootfs) != 0)
                 die(a->err_fd, errno);
             if (::chdir("/") != 0)
